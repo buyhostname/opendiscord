@@ -79,6 +79,10 @@ const threadToSession = new Map();
 // Sync channel reference (will be populated on ready)
 let syncChannel = null;
 const SYNC_CHANNEL_NAME = process.env.DISCORD_SYNC_CHANNEL || 'opencode-sync';
+// Track last posted content to avoid duplicates (sessionId -> { userContent, assistantContent })
+const lastPostedContent = new Map();
+// Track sessions initiated from Discord (these should NOT be synced back to Discord)
+const discordInitiatedSessions = new Set();
 
 // Parse allowed users whitelist from environment
 const allowedUsers = process.env.DISCORD_ALLOWED_USERS
@@ -569,37 +573,26 @@ async function handleSyncThreadReply(threadId, userMessage, content) {
         // Show typing indicator
         await userMessage.channel.sendTyping();
         
-        // Send to OpenCode and stream response
-        const subscription = await opencode.session.chat({
-            sessionId: sessionId,
-            content: content,
-        });
+        // Get model for user (or use default)
+        const userId = userMessage.author.id;
+        const userModel = getUserModel(userId);
+        const modelObj = parseModelId(userModel);
         
-        let fullResponse = '';
-        let lastUpdate = Date.now();
+        // Use the same sendPrompt function as main handler
+        const parts = [{ type: 'text', text: content }];
+        const response = await sendPrompt(sessionId, parts, modelObj);
         
-        for await (const event of subscription) {
-            if (event.type === 'message.updated') {
-                const message = event.properties?.message;
-                if (message && message.role === 'assistant') {
-                    // Extract text content
-                    let text = '';
-                    for (const part of message.parts || []) {
-                        if (part.type === 'text') {
-                            text += part.text || '';
-                        }
-                    }
-                    fullResponse = text;
-                }
-            }
-        }
+        console.log(`Got response from OpenCode for thread reply`);
+        
+        // Extract response text using same function as main handler
+        const fullResponse = extractResponseText(response);
         
         // Post the response to the thread
         if (fullResponse) {
-            const parts = splitMessage(fullResponse, 1900);
-            for (let i = 0; i < parts.length; i++) {
+            const responseParts = splitMessage(fullResponse, 1900);
+            for (let i = 0; i < responseParts.length; i++) {
                 const prefix = i === 0 ? '**Assistant:**\n' : '';
-                await userMessage.channel.send(prefix + parts[i]);
+                await userMessage.channel.send(prefix + responseParts[i]);
             }
         } else {
             await userMessage.channel.send('*No response from AI*');
@@ -607,6 +600,210 @@ async function handleSyncThreadReply(threadId, userMessage, content) {
     } catch (error) {
         console.error('Failed to forward to OpenCode:', error.message);
         await userMessage.channel.send(`*Error: ${error.message}*`);
+    }
+}
+
+// ============================================
+// Global Event Subscription for Session Sync
+// ============================================
+
+/**
+ * Extract text content from a message
+ */
+function extractMessageContent(message) {
+    if (!message) return '';
+    // Parts can be at message.parts or message.info might not have parts
+    const parts = message.parts || [];
+    if (parts.length === 0) return '';
+    
+    let content = '';
+    for (const part of parts) {
+        if (part.type === 'text') {
+            content += part.text || '';
+        }
+    }
+    return content.trim();
+}
+
+/**
+ * Get the latest user prompt and assistant response pair from messages
+ */
+function getLatestExchange(messages) {
+    let lastUserIdx = -1;
+    let lastAssistantIdx = -1;
+    
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        // Role can be at msg.role or msg.info.role depending on API response
+        const role = msg.role || msg.info?.role;
+        if (role === 'assistant' && lastAssistantIdx === -1) {
+            lastAssistantIdx = i;
+        }
+        if (role === 'user' && lastAssistantIdx !== -1) {
+            lastUserIdx = i;
+            break;
+        }
+    }
+    
+    if (lastUserIdx === -1 || lastAssistantIdx === -1) {
+        return null;
+    }
+    
+    return {
+        userMessage: messages[lastUserIdx],
+        assistantMessage: messages[lastAssistantIdx]
+    };
+}
+
+/**
+ * Handle session.idle event - sync terminal session to Discord
+ */
+async function handleSessionIdle(sessionId) {
+    // Skip sessions initiated from Discord (they're already in Discord)
+    if (discordInitiatedSessions.has(sessionId)) {
+        console.log(`Skipping sync for Discord-initiated session: ${sessionId.slice(0, 8)}`);
+        return;
+    }
+    
+    console.log(`Session idle event for: ${sessionId.slice(0, 8)}`);
+    
+    try {
+        // Get messages for this session
+        const messagesResult = await opencode.session.messages({
+            path: { id: sessionId }
+        });
+        
+        // Debug: log raw result structure
+        console.log(`Messages result keys: ${Object.keys(messagesResult || {}).join(', ')}`);
+        
+        // Messages might be in .data or directly in the result
+        let messages = messagesResult.data || messagesResult || [];
+        if (!Array.isArray(messages)) {
+            // If it's an object with values, try to get the array
+            if (typeof messages === 'object') {
+                messages = Object.values(messages);
+            }
+        }
+        
+        console.log(`Session ${sessionId.slice(0, 8)} has ${messages.length} messages`);
+        if (messages.length === 0) {
+            console.log(`No messages in session ${sessionId.slice(0, 8)}`);
+            return;
+        }
+        
+        // Debug: log message roles (check structure)
+        const roles = messages.map(m => m.role || m.info?.role || '?').join(', ');
+        console.log(`Message roles (first 10): ${roles.split(', ').slice(0, 10).join(', ')}`);
+        
+        // Debug: log first message structure
+        if (messages.length > 0) {
+            console.log(`First message keys: ${Object.keys(messages[0]).join(', ')}`);
+        }
+        console.log(`Message roles: ${roles}`);
+        
+        const exchange = getLatestExchange(messages);
+        if (!exchange) {
+            console.log(`No complete exchange in session ${sessionId.slice(0, 8)}`);
+            return;
+        }
+        
+        const userContent = extractMessageContent(exchange.userMessage);
+        const assistantContent = extractMessageContent(exchange.assistantMessage);
+        
+        if (!userContent && !assistantContent) {
+            return;
+        }
+        
+        // Check if we already posted this exact content (dedup)
+        const lastPosted = lastPostedContent.get(sessionId);
+        if (lastPosted && 
+            lastPosted.userContent === userContent && 
+            lastPosted.assistantContent === assistantContent) {
+            console.log(`Already posted this content for session ${sessionId.slice(0, 8)}`);
+            return;
+        }
+        
+        // Get or create thread for this session
+        let threadId = sessionToThread.get(sessionId);
+        
+        if (!threadId) {
+            const threadName = userContent.slice(0, 50) || 'OpenCode Session';
+            console.log(`Creating sync thread: "${threadName}" for session ${sessionId.slice(0, 8)}`);
+            
+            const thread = await createSyncThread(sessionId, threadName, process.cwd());
+            if (!thread) {
+                console.error('Failed to create sync thread');
+                return;
+            }
+            threadId = thread.id;
+        }
+        
+        // Post the message exchange to the thread
+        console.log(`Posting to thread ${threadId} for session ${sessionId.slice(0, 8)}`);
+        await postToSyncThread(threadId, userContent, assistantContent);
+        
+        // Track what we posted to avoid duplicates
+        lastPostedContent.set(sessionId, { userContent, assistantContent });
+        
+    } catch (error) {
+        console.error(`Failed to sync session ${sessionId.slice(0, 8)}:`, error.message);
+    }
+}
+
+/**
+ * Start global event subscription to sync terminal sessions to Discord
+ */
+async function startGlobalEventSubscription() {
+    console.log('Starting global event subscription for session sync...');
+    
+    try {
+        const eventStream = await opencode.global.event();
+        
+        console.log('Global event subscription established');
+        
+        // Process events from the stream
+        for await (const event of eventStream.stream) {
+            try {
+                // Events come wrapped in { payload: { type, properties } }
+                const payload = event?.payload || event;
+                const eventType = payload?.type;
+                
+                // Debug: log events (skip frequent ones like deltas)
+                if (eventType && !['message.part.delta', 'message.part.updated'].includes(eventType)) {
+                    console.log(`[SYNC] Event: ${eventType}`, JSON.stringify(payload.properties || {}).slice(0, 200));
+                }
+                
+                // Handle session becoming idle (via session.status event)
+                // session.status has: { sessionID, status: { type: "idle" | "busy" } }
+                if (eventType === 'session.status') {
+                    const sessionId = payload.properties?.sessionID;
+                    const statusType = payload.properties?.status?.type;
+                    if (sessionId && statusType === 'idle') {
+                        console.log(`[SYNC] Session ${sessionId.slice(0, 8)} became idle`);
+                        // Use setTimeout to avoid blocking the event loop
+                        setTimeout(() => handleSessionIdle(sessionId), 100);
+                    }
+                }
+                
+                // Handle session.deleted - clean up mappings
+                if (eventType === 'session.deleted') {
+                    const sessionId = payload.properties?.sessionId;
+                    if (sessionId) {
+                        sessionToThread.delete(sessionId);
+                        lastPostedContent.delete(sessionId);
+                        discordInitiatedSessions.delete(sessionId);
+                        // Note: we don't delete threadToSession so replies still work
+                    }
+                }
+            } catch (eventError) {
+                console.error('Error processing event:', eventError.message);
+            }
+        }
+    } catch (error) {
+        console.error('Global event subscription failed:', error.message);
+        // Retry after delay
+        console.log('Retrying event subscription in 10 seconds...');
+        setTimeout(startGlobalEventSubscription, 10000);
     }
 }
 
@@ -776,6 +973,8 @@ async function handleNewCommand(interaction) {
     try {
         const { data: newSession } = await opencode.session.create({});
         userSessions.set(userId, newSession.id);
+        // Mark as Discord-initiated so we don't sync back to Discord
+        discordInitiatedSessions.add(newSession.id);
         
         await interaction.editReply(
             `New session created!\n\n` +
@@ -1107,6 +1306,8 @@ client.on('messageCreate', async (message) => {
             const { data: newSession } = await opencode.session.create({});
             sessionId = newSession.id;
             userSessions.set(userId, sessionId);
+            // Mark as Discord-initiated so we don't sync back to Discord
+            discordInitiatedSessions.add(sessionId);
         }
         
         // Handle voice message
@@ -1326,6 +1527,9 @@ client.once('ready', async () => {
         
         // Ensure sync channel exists for OpenCode session sync
         await ensureSyncChannel();
+        
+        // Start global event subscription for terminal session sync
+        startGlobalEventSubscription();
     } else {
         console.warn(`Warning: Could not find guild with ID ${process.env.DISCORD_GUILD_ID}`);
     }
