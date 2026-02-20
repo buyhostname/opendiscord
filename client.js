@@ -69,6 +69,17 @@ let modelIndex = new Map();
 // Track bot start time to ignore old messages
 const botStartTime = Date.now();
 
+// ============================================
+// OpenCode Sync - Session/Thread Mappings
+// ============================================
+// Maps OpenCode sessionId -> Discord threadId
+const sessionToThread = new Map();
+// Maps Discord threadId -> OpenCode sessionId  
+const threadToSession = new Map();
+// Sync channel reference (will be populated on ready)
+let syncChannel = null;
+const SYNC_CHANNEL_NAME = process.env.DISCORD_SYNC_CHANNEL || 'opencode-sync';
+
 // Parse allowed users whitelist from environment
 const allowedUsers = process.env.DISCORD_ALLOWED_USERS
     ? process.env.DISCORD_ALLOWED_USERS.split(',').map(id => id.trim()).filter(id => id && id !== '0')
@@ -415,6 +426,188 @@ async function ensureChangelogChannel() {
     
     console.log(`Changelog channel ready: #${channel.name}`);
     return channel;
+}
+
+// Ensure #opencode-sync channel exists for OpenCode session sync
+async function ensureSyncChannel() {
+    const guild = await getGuild();
+    if (!guild) return null;
+    
+    // Find sync channel by name or ID
+    let channel = guild.channels.cache.find(ch => 
+        ch.name === SYNC_CHANNEL_NAME || ch.id === SYNC_CHANNEL_NAME
+    );
+    
+    // Create channel if it doesn't exist
+    if (!channel) {
+        try {
+            channel = await guild.channels.create({
+                name: SYNC_CHANNEL_NAME,
+                type: ChannelType.GuildText,
+                topic: 'OpenCode terminal session sync - threads mirror conversations',
+                reason: 'OpenCode sync channel for terminal sessions'
+            });
+            console.log(`Created sync channel: #${SYNC_CHANNEL_NAME}`);
+            
+            // Send welcome message
+            const embed = new EmbedBuilder()
+                .setColor(0x00D26A)
+                .setTitle('OpenCode Session Sync')
+                .setDescription('This channel syncs OpenCode terminal sessions to Discord threads.\n\n' +
+                    '**How it works:**\n' +
+                    '• Each OpenCode session creates a thread here\n' +
+                    '• User prompts and AI responses are posted to the thread\n' +
+                    '• Reply in a thread to send messages back to OpenCode\n\n' +
+                    '*Only sessions from the configured OpenCode server (port 4098) are synced.*')
+                .setTimestamp()
+                .setFooter({ text: 'OpenCode Sync initialized' });
+            
+            await channel.send({ embeds: [embed] });
+        } catch (error) {
+            console.error('Failed to create sync channel:', error.message);
+            return null;
+        }
+    }
+    
+    console.log(`Sync channel ready: #${channel.name}`);
+    syncChannel = channel;
+    return channel;
+}
+
+// Create a thread in the sync channel for an OpenCode session
+async function createSyncThread(sessionId, title, directory) {
+    if (!syncChannel) {
+        syncChannel = await ensureSyncChannel();
+    }
+    if (!syncChannel) {
+        console.error('Cannot create sync thread: sync channel not available');
+        return null;
+    }
+    
+    try {
+        // Create starter message for the thread
+        const embed = new EmbedBuilder()
+            .setColor(0x00D26A)
+            .setTitle(title.slice(0, 100) || 'OpenCode Session')
+            .setDescription(`Session: \`${sessionId.slice(0, 8)}...\`\nDirectory: \`${directory || 'unknown'}\``)
+            .setTimestamp()
+            .setFooter({ text: 'Reply to this thread to send messages to OpenCode' });
+        
+        const starterMessage = await syncChannel.send({ embeds: [embed] });
+        
+        // Create thread from the message
+        const thread = await starterMessage.startThread({
+            name: title.slice(0, 100) || 'OpenCode Session',
+            autoArchiveDuration: 1440, // 24 hours
+            reason: `OpenCode session sync: ${sessionId}`
+        });
+        
+        // Store mappings
+        sessionToThread.set(sessionId, thread.id);
+        threadToSession.set(thread.id, sessionId);
+        
+        // Subscribe to thread for replies
+        subscribedThreads.add(thread.id);
+        
+        console.log(`Created sync thread: ${thread.name} (${thread.id}) for session ${sessionId.slice(0, 8)}`);
+        return thread;
+    } catch (error) {
+        console.error('Failed to create sync thread:', error.message);
+        return null;
+    }
+}
+
+// Post a message exchange to a sync thread
+async function postToSyncThread(threadId, userContent, assistantContent) {
+    try {
+        const thread = await client.channels.fetch(threadId);
+        if (!thread || !thread.isThread()) {
+            console.error('Invalid thread ID:', threadId);
+            return false;
+        }
+        
+        // Format user message
+        if (userContent) {
+            const userParts = splitMessage(userContent, 1900);
+            for (let i = 0; i < userParts.length; i++) {
+                const content = i === 0 
+                    ? `**User:**\n${userParts[i]}`
+                    : userParts[i];
+                await thread.send(content);
+            }
+        }
+        
+        // Format assistant message
+        if (assistantContent) {
+            const assistantParts = splitMessage(assistantContent, 1900);
+            for (let i = 0; i < assistantParts.length; i++) {
+                const content = i === 0
+                    ? `**Assistant:**\n${assistantParts[i]}`
+                    : assistantParts[i];
+                await thread.send(content);
+            }
+        }
+        
+        return true;
+    } catch (error) {
+        console.error('Failed to post to sync thread:', error.message);
+        return false;
+    }
+}
+
+// Handle a message from Discord thread -> forward to OpenCode
+async function handleSyncThreadReply(threadId, userMessage, content) {
+    const sessionId = threadToSession.get(threadId);
+    if (!sessionId) {
+        console.error('No session found for thread:', threadId);
+        return;
+    }
+    
+    console.log(`Forwarding thread reply to OpenCode session ${sessionId.slice(0, 8)}: "${content.slice(0, 50)}..."`);
+    
+    try {
+        // Show typing indicator
+        await userMessage.channel.sendTyping();
+        
+        // Send to OpenCode and stream response
+        const subscription = await opencode.session.chat({
+            sessionId: sessionId,
+            content: content,
+        });
+        
+        let fullResponse = '';
+        let lastUpdate = Date.now();
+        
+        for await (const event of subscription) {
+            if (event.type === 'message.updated') {
+                const message = event.properties?.message;
+                if (message && message.role === 'assistant') {
+                    // Extract text content
+                    let text = '';
+                    for (const part of message.parts || []) {
+                        if (part.type === 'text') {
+                            text += part.text || '';
+                        }
+                    }
+                    fullResponse = text;
+                }
+            }
+        }
+        
+        // Post the response to the thread
+        if (fullResponse) {
+            const parts = splitMessage(fullResponse, 1900);
+            for (let i = 0; i < parts.length; i++) {
+                const prefix = i === 0 ? '**Assistant:**\n' : '';
+                await userMessage.channel.send(prefix + parts[i]);
+            }
+        } else {
+            await userMessage.channel.send('*No response from AI*');
+        }
+    } catch (error) {
+        console.error('Failed to forward to OpenCode:', error.message);
+        await userMessage.channel.send(`*Error: ${error.message}*`);
+    }
 }
 
 // Split long messages for Discord (2000 char limit)
@@ -870,6 +1063,25 @@ client.on('messageCreate', async (message) => {
         return;
     }
     
+    // Check if this is a reply in a sync thread (OpenCode session sync)
+    if (message.channel.isThread() && threadToSession.has(message.channel.id)) {
+        // This is a sync thread - forward to OpenCode instead of normal handling
+        const content = message.content?.trim();
+        if (content) {
+            await message.react('⏳');
+            try {
+                await handleSyncThreadReply(message.channel.id, message, content);
+                await message.reactions.cache.get('⏳')?.remove();
+                await message.react('✅');
+            } catch (error) {
+                await message.reactions.cache.get('⏳')?.remove();
+                await message.react('❌');
+                console.error('Error handling sync thread reply:', error);
+            }
+        }
+        return;
+    }
+    
     // Check for voice messages
     const voiceAttachment = message.attachments.find(att => 
         att.contentType?.startsWith('audio/') ||
@@ -1111,11 +1323,14 @@ client.once('ready', async () => {
         
         // Ensure changelog channel exists
         await ensureChangelogChannel();
+        
+        // Ensure sync channel exists for OpenCode session sync
+        await ensureSyncChannel();
     } else {
         console.warn(`Warning: Could not find guild with ID ${process.env.DISCORD_GUILD_ID}`);
     }
     
-    // Start git webhook server
+    // Start git webhook server (also handles sync endpoints)
     startGitWebhookServer();
 });
 
@@ -1209,9 +1424,23 @@ async function postGitCommit(commitData) {
 }
 
 function startGitWebhookServer() {
+    // Helper to parse JSON body
+    const parseBody = (req) => new Promise((resolve, reject) => {
+        let body = '';
+        req.on('data', chunk => body += chunk.toString());
+        req.on('end', () => {
+            try {
+                resolve(JSON.parse(body));
+            } catch (e) {
+                reject(new Error('Invalid JSON'));
+            }
+        });
+        req.on('error', reject);
+    });
+    
     const server = http.createServer(async (req, res) => {
         res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
         
         if (req.method === 'OPTIONS') {
@@ -1220,36 +1449,127 @@ function startGitWebhookServer() {
             return;
         }
         
-        if (req.method === 'POST' && req.url === '/git-commit') {
-            let body = '';
-            req.on('data', chunk => body += chunk.toString());
-            req.on('end', async () => {
-                try {
-                    const commitData = JSON.parse(body);
-                    if (!commitData.hash || !commitData.message) {
-                        res.writeHead(400, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ error: 'Missing hash or message' }));
-                        return;
-                    }
-                    const success = await postGitCommit(commitData);
-                    res.writeHead(success ? 200 : 500, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ success }));
-                } catch (error) {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ error: error.message }));
-                }
-            });
-        } else if (req.method === 'GET' && req.url === '/health') {
+        // Health check
+        if (req.method === 'GET' && req.url === '/health') {
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'ok' }));
-        } else {
-            res.writeHead(404);
-            res.end();
+            res.end(JSON.stringify({ status: 'ok', syncChannel: syncChannel?.id || null }));
+            return;
         }
+        
+        // Git commit webhook
+        if (req.method === 'POST' && req.url === '/git-commit') {
+            try {
+                const commitData = await parseBody(req);
+                if (!commitData.hash || !commitData.message) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: 'Missing hash or message' }));
+                    return;
+                }
+                const success = await postGitCommit(commitData);
+                res.writeHead(success ? 200 : 500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success }));
+            } catch (error) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: error.message }));
+            }
+            return;
+        }
+        
+        // ============================================
+        // OpenCode Sync Endpoints
+        // ============================================
+        
+        // POST /sync/session - Create a new sync thread for an OpenCode session
+        if (req.method === 'POST' && req.url === '/sync/session') {
+            try {
+                const data = await parseBody(req);
+                const { sessionId, title, directory } = data;
+                
+                if (!sessionId) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: 'Missing sessionId' }));
+                    return;
+                }
+                
+                // Check if thread already exists for this session
+                if (sessionToThread.has(sessionId)) {
+                    const existingThreadId = sessionToThread.get(sessionId);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: true, threadId: existingThreadId, existing: true }));
+                    return;
+                }
+                
+                // Create new thread
+                const thread = await createSyncThread(sessionId, title || 'OpenCode Session', directory);
+                
+                if (thread) {
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: true, threadId: thread.id }));
+                } else {
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: 'Failed to create thread' }));
+                }
+            } catch (error) {
+                console.error('Error in /sync/session:', error);
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: error.message }));
+            }
+            return;
+        }
+        
+        // POST /sync/message - Post a message exchange to a sync thread
+        if (req.method === 'POST' && req.url === '/sync/message') {
+            try {
+                const data = await parseBody(req);
+                const { sessionId, threadId, userContent, assistantContent } = data;
+                
+                // Get thread ID from sessionId if not provided
+                let targetThreadId = threadId;
+                if (!targetThreadId && sessionId) {
+                    targetThreadId = sessionToThread.get(sessionId);
+                }
+                
+                if (!targetThreadId) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: 'Missing threadId or sessionId not mapped' }));
+                    return;
+                }
+                
+                const success = await postToSyncThread(targetThreadId, userContent, assistantContent);
+                res.writeHead(success ? 200 : 500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success }));
+            } catch (error) {
+                console.error('Error in /sync/message:', error);
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: error.message }));
+            }
+            return;
+        }
+        
+        // GET /sync/status - Get sync status and mappings (for debugging)
+        if (req.method === 'GET' && req.url === '/sync/status') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                syncChannelId: syncChannel?.id || null,
+                syncChannelName: syncChannel?.name || null,
+                activeSessions: sessionToThread.size,
+                sessions: Object.fromEntries(sessionToThread)
+            }));
+            return;
+        }
+        
+        // 404 for unknown routes
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not found' }));
     });
     
     server.listen(GIT_WEBHOOK_PORT, '127.0.0.1', () => {
-        console.log(`Git webhook server listening on http://127.0.0.1:${GIT_WEBHOOK_PORT}`);
+        console.log(`Webhook server listening on http://127.0.0.1:${GIT_WEBHOOK_PORT}`);
+        console.log(`  - POST /git-commit     - Git commit notifications`);
+        console.log(`  - POST /sync/session   - Create sync thread for OpenCode session`);
+        console.log(`  - POST /sync/message   - Post message to sync thread`);
+        console.log(`  - GET  /sync/status    - Get sync status`);
+        console.log(`  - GET  /health         - Health check`);
     });
 }
 

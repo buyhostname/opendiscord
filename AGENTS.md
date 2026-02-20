@@ -278,6 +278,7 @@ After starting the bot, tell the user:
 | DISCORD_CLIENT_ID | Yes | Application ID from Developer Portal |
 | DISCORD_GUILD_ID | Yes | Your server's ID |
 | DISCORD_CHANGELOG_CHANNEL | No | Channel for logging changes (default: changelog) |
+| DISCORD_SYNC_CHANNEL | No | Channel for OpenCode session sync (default: opencode-sync) |
 | DISCORD_ADMIN_ROLE | No | Admin role name (default: admin) |
 | DISCORD_EDIT_ROLE | No | Edit role name (default: edit) |
 | DISCORD_ALLOWED_USERS | No | Comma-separated user IDs (auto-generated on first message) |
@@ -286,6 +287,8 @@ After starting the bot, tell the user:
 | OPENCODE_MODEL | No | Default AI model |
 | SESSION_SECRET | Yes | Random string for sessions |
 | OPENAI_API_KEY | No | For voice transcription - get from https://platform.openai.com/api-keys |
+| GIT_WEBHOOK_PORT | No | Port for webhook server (default: 4099) |
+| DISCORD_SYNC_URL | No | URL for plugin to reach webhook server (default: http://127.0.0.1:4099) |
 
 ## Common Issues
 
@@ -422,3 +425,120 @@ Add an entry like this to the JSON array (adjust the port to match your `OPENCOD
 **Important:** Make sure the port in the URL (`4097` in this example) matches the `OPENCODE_PORT` value in your `.env` file.
 
 If a button with the same `id` already exists, modify it instead of adding a duplicate.
+
+## OpenCode Terminal Session Sync
+
+This feature syncs OpenCode terminal sessions to Discord threads in real-time. When you chat with OpenCode in a terminal, the conversation is mirrored to a Discord thread. You can reply to the Discord thread to send messages back to OpenCode.
+
+### How It Works
+
+1. **Plugin-based**: The sync is powered by a plugin (`plugins/discord-sync.js`) that runs inside OpenCode
+2. **Thread per session**: Each OpenCode session creates a new thread in `#opencode-sync`
+3. **Two-way sync**: 
+   - Terminal → Discord: User prompts and AI responses are posted to the thread
+   - Discord → Terminal: Replies in the thread are forwarded to OpenCode
+4. **Port-specific**: Only syncs sessions from OpenCode on port 4098 (configurable in the plugin)
+
+### Setup Instructions
+
+#### 1. Install the Plugin
+
+Copy the plugin to your OpenCode plugins directory:
+
+```bash
+# For global installation (all projects)
+mkdir -p ~/.config/opencode/plugins
+cp /root/opendiscord/plugins/discord-sync.js ~/.config/opencode/plugins/
+
+# OR for project-specific installation
+mkdir -p .opencode/plugins
+cp /root/opendiscord/plugins/discord-sync.js .opencode/plugins/
+```
+
+#### 2. Configure Environment (Optional)
+
+The plugin uses these environment variables:
+
+```bash
+# URL of the webhook server (set this if not using default)
+export DISCORD_SYNC_URL=http://127.0.0.1:4099
+```
+
+#### 3. Ensure Services Are Running
+
+Make sure both the Discord client and OpenCode server are running:
+
+```bash
+# Check status
+pm2 list
+
+# Should see:
+# - discord-c-4098 (Discord client + webhook server)
+# - discord-s-4098 (OpenCode server on port 4098)
+```
+
+#### 4. Verify Sync Channel
+
+The bot will automatically create `#opencode-sync` channel on startup. If it doesn't exist, check:
+- Bot has "Manage Channels" permission
+- DISCORD_GUILD_ID is set correctly
+
+### Using the Sync
+
+1. **Start a session**: Open OpenCode terminal and start chatting
+   ```bash
+   opencode
+   ```
+
+2. **Check Discord**: A new thread will appear in `#opencode-sync` with your session
+
+3. **Reply from Discord**: Type a message in the thread to send it to OpenCode
+
+4. **See response**: The AI response will be posted back to the thread
+
+### Webhook Server Endpoints
+
+The webhook server (port 4099) exposes these endpoints for sync:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/sync/session` | POST | Create a new thread for a session |
+| `/sync/message` | POST | Post a message exchange to a thread |
+| `/sync/status` | GET | Get sync status and active sessions |
+| `/health` | GET | Health check |
+
+Example: Check sync status
+```bash
+curl http://127.0.0.1:4099/sync/status
+```
+
+### Troubleshooting Sync
+
+#### Sync not working
+1. Check plugin is installed: `ls ~/.config/opencode/plugins/`
+2. Check OpenCode logs for plugin load errors
+3. Verify webhook server is running: `curl http://127.0.0.1:4099/health`
+
+#### Thread not created
+- Check `#opencode-sync` channel exists
+- Verify bot has permission to create threads
+- Check pm2 logs: `pm2 logs discord-c-4098`
+
+#### Discord replies not forwarding
+- User must have `admin` or `edit` role
+- User must be in the configured guild
+- Check the thread is in `#opencode-sync` channel
+
+### Customizing the Plugin
+
+To change which OpenCode port triggers sync, edit `plugins/discord-sync.js`:
+
+```javascript
+const SYNC_PORT = 4098; // Change to your port
+```
+
+To change the webhook server URL:
+
+```javascript
+const SYNC_URL = process.env.DISCORD_SYNC_URL || 'http://127.0.0.1:4099';
+```
