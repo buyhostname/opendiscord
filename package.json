@@ -1,0 +1,17 @@
+{
+  "name": "opendiscord",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Discord bot that connects to OpenCode server via SDK",
+  "scripts": {
+    "server": "node server.js",
+    "client": "node client.js",
+    "deploy": "node deploy-commands.js"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.2.6",
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.3.1",
+    "openai": "^6.22.0"
+  }
+}
