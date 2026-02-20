@@ -300,7 +300,7 @@ function parseFileChanges(responseText) {
 }
 
 // Post to changelog channel
-async function postChangelog(userId, taskSummary, filesChanged) {
+async function postChangelog(userId, taskSummary, filesChanged, action = 'update') {
     const guild = await getGuild();
     if (!guild) return;
     
@@ -317,6 +317,7 @@ async function postChangelog(userId, taskSummary, filesChanged) {
             channel = await guild.channels.create({
                 name: channelName,
                 type: ChannelType.GuildText,
+                topic: 'Codebase changes made via OpenDiscord bot',
                 reason: 'OpenDiscord changelog channel'
             });
             console.log(`Created changelog channel: #${channelName}`);
@@ -326,24 +327,87 @@ async function postChangelog(userId, taskSummary, filesChanged) {
         }
     }
     
+    // Determine color and title based on action
+    let color = 0x5865F2; // Discord blurple (default)
+    let title = 'Codebase Update';
+    let emoji = '';
+    
+    if (action === 'create') {
+        color = 0x57F287; // Green
+        title = 'Files Created';
+        emoji = '+';
+    } else if (action === 'edit') {
+        color = 0xFEE75C; // Yellow
+        title = 'Files Modified';
+        emoji = '~';
+    } else if (action === 'delete') {
+        color = 0xED4245; // Red
+        title = 'Files Deleted';
+        emoji = '-';
+    }
+    
     // Create changelog embed
     const embed = new EmbedBuilder()
-        .setColor(0x5865F2) // Discord blurple
-        .setTitle('Codebase Update')
+        .setColor(color)
+        .setTitle(title)
         .setDescription(taskSummary.length > 2000 ? taskSummary.slice(0, 2000) + '...' : taskSummary)
         .addFields(
             { name: 'Initiated by', value: `<@${userId}>`, inline: true },
-            { name: 'Files Changed', value: filesChanged.length > 0 ? filesChanged.slice(0, 10).map(f => `\`${f}\``).join('\n') : 'No files detected', inline: true }
+            { name: 'Files Changed', value: filesChanged.length > 0 ? filesChanged.slice(0, 10).map(f => `\`${emoji}${f}\``).join('\n') : 'No files detected', inline: true }
         )
         .setTimestamp()
         .setFooter({ text: 'OpenDiscord' });
     
     try {
         await channel.send({ embeds: [embed] });
-        console.log(`Posted changelog for user ${userId}`);
+        console.log(`Posted changelog for user ${userId}: ${filesChanged.length} files`);
     } catch (error) {
         console.error('Failed to post changelog:', error.message);
     }
+    
+    return channel;
+}
+
+// Ensure changelog channel exists on startup
+async function ensureChangelogChannel() {
+    const guild = await getGuild();
+    if (!guild) return null;
+    
+    const channelName = process.env.DISCORD_CHANGELOG_CHANNEL || 'changelog';
+    
+    // Find changelog channel by name or ID
+    let channel = guild.channels.cache.find(ch => 
+        ch.name === channelName || ch.id === channelName
+    );
+    
+    // Create channel if it doesn't exist
+    if (!channel) {
+        try {
+            channel = await guild.channels.create({
+                name: channelName,
+                type: ChannelType.GuildText,
+                topic: 'Codebase changes made via OpenDiscord bot',
+                reason: 'OpenDiscord changelog channel'
+            });
+            console.log(`Created changelog channel on startup: #${channelName}`);
+            
+            // Send welcome message
+            const embed = new EmbedBuilder()
+                .setColor(0x5865F2)
+                .setTitle('OpenDiscord Changelog')
+                .setDescription('This channel logs all codebase changes made through the OpenDiscord bot.\n\nEach entry includes:\n- Who initiated the change\n- Summary of what was done\n- Files that were modified')
+                .setTimestamp()
+                .setFooter({ text: 'OpenDiscord initialized' });
+            
+            await channel.send({ embeds: [embed] });
+        } catch (error) {
+            console.error('Failed to create changelog channel on startup:', error.message);
+            return null;
+        }
+    }
+    
+    console.log(`Changelog channel ready: #${channel.name}`);
+    return channel;
 }
 
 // Split long messages for Discord (2000 char limit)
@@ -1007,7 +1071,7 @@ async function handleImageMessage(message, imageAttachments, sessionId) {
 }
 
 // Bot ready event
-client.once('ready', () => {
+client.once('ready', async () => {
     console.log(`Discord bot logged in as ${client.user.tag}`);
     console.log(`Bot is in ${client.guilds.cache.size} guild(s)`);
     
@@ -1015,6 +1079,9 @@ client.once('ready', () => {
     const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
     if (guild) {
         console.log(`Connected to guild: ${guild.name} (${guild.id})`);
+        
+        // Ensure changelog channel exists
+        await ensureChangelogChannel();
     } else {
         console.warn(`Warning: Could not find guild with ID ${process.env.DISCORD_GUILD_ID}`);
     }
