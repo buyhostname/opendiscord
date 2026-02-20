@@ -16,6 +16,7 @@ import {
 } from 'discord.js';
 import { createOpencodeClient } from '@opencode-ai/sdk/client';
 import OpenAI from 'openai';
+import sharp from 'sharp';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -63,8 +64,9 @@ const userModels = new Map();
 // Set of thread IDs
 const subscribedThreads = new Set();
 
-// Store models temporarily for button lookups (indexed)
-let modelIndex = new Map();
+// Store models temporarily for button lookups (indexed by interaction message)
+// Key: interactionId or messageId, Value: Map of buttonIndex -> model
+let modelButtonMaps = new Map();
 
 // Track bot start time to ignore old messages
 const botStartTime = Date.now();
@@ -240,10 +242,6 @@ async function getAvailableModels() {
                 }
             }
         }
-        
-        // Update model index for button lookups
-        modelIndex.clear();
-        models.forEach((model, idx) => modelIndex.set(idx, model));
         
         console.log(`Loaded ${models.length} models from OpenCode server`);
         return models;
@@ -1053,12 +1051,28 @@ async function handleModelsCommand(interaction) {
     
     const userId = interaction.user.id;
     const currentModel = getUserModel(userId);
-    const models = await getAvailableModels();
+    const filter = interaction.options?.getString('filter')?.toLowerCase() || '';
+    
+    let models = await getAvailableModels();
+    
+    // Apply filter if provided
+    if (filter) {
+        models = models.filter(m => 
+            m.name.toLowerCase().includes(filter) || 
+            m.id.toLowerCase().includes(filter)
+        );
+    }
     
     if (models.length === 0) {
-        await interaction.editReply('Unable to load models. Please try again later.');
+        const msg = filter 
+            ? `No models found matching "${filter}". Try a different filter.`
+            : 'Unable to load models. Please try again later.';
+        await interaction.editReply(msg);
         return;
     }
+    
+    // Create a button map for this interaction (maps button index -> model)
+    const buttonMap = new Map();
     
     // Create buttons for first 25 models (Discord limit)
     const rows = [];
@@ -1072,6 +1086,9 @@ async function handleModelsCommand(interaction) {
             const model = models[j];
             const isSelected = model.id === currentModel;
             
+            // Store model in button map
+            buttonMap.set(j, model);
+            
             row.addComponents(
                 new ButtonBuilder()
                     .setCustomId(`model_${j}`)
@@ -1083,8 +1100,13 @@ async function handleModelsCommand(interaction) {
         rows.push(row);
     }
     
-    // Add navigation if more models
+    // Add navigation if more models (store remaining models for pagination)
     if (models.length > maxButtons) {
+        // Store all models for pagination
+        for (let j = maxButtons; j < models.length; j++) {
+            buttonMap.set(j, models[j]);
+        }
+        
         const navRow = new ActionRowBuilder()
             .addComponents(
                 new ButtonBuilder()
@@ -1095,10 +1117,17 @@ async function handleModelsCommand(interaction) {
         rows.push(navRow);
     }
     
-    await interaction.editReply({
-        content: `**Available Models** (${models.length} total)\n\nTap a model to select it.\n\nCurrent: \`${currentModel}\``,
+    const filterMsg = filter ? ` matching "${filter}"` : '';
+    const reply = await interaction.editReply({
+        content: `**Available Models${filterMsg}** (${models.length} total)\n\nTap a model to select it.\n\nCurrent: \`${currentModel}\``,
         components: rows
     });
+    
+    // Store the button map keyed by the interaction ID
+    modelButtonMaps.set(interaction.id, buttonMap);
+    
+    // Clean up old maps after 10 minutes
+    setTimeout(() => modelButtonMaps.delete(interaction.id), 10 * 60 * 1000);
 }
 
 async function handleHelpCommand(interaction) {
@@ -1143,7 +1172,18 @@ async function handleButtonInteraction(interaction) {
     // Handle model selection
     if (customId.startsWith('model_')) {
         const idx = parseInt(customId.replace('model_', ''), 10);
-        const model = modelIndex.get(idx);
+        
+        // Try to find the model from stored button maps
+        // Check by message reference (the original interaction that created the buttons)
+        let model = null;
+        
+        // Look through all button maps to find one that has this index
+        for (const [interactionId, buttonMap] of modelButtonMaps) {
+            if (buttonMap.has(idx)) {
+                model = buttonMap.get(idx);
+                break;
+            }
+        }
         
         if (model) {
             userModels.set(userId, model.id);
@@ -1154,7 +1194,7 @@ async function handleButtonInteraction(interaction) {
             });
         } else {
             await interaction.reply({
-                content: 'Model not found. Try `/models` again.',
+                content: 'Model selection expired. Please run `/models` again.',
                 ephemeral: true
             });
         }
@@ -1171,6 +1211,9 @@ async function handleButtonInteraction(interaction) {
         const models = await getAvailableModels();
         const pageModels = models.slice(start, start + pageSize);
         
+        // Create a new button map for this page
+        const buttonMap = new Map();
+        
         const rows = [];
         const buttonsPerRow = 5;
         
@@ -1181,6 +1224,9 @@ async function handleButtonInteraction(interaction) {
                 const model = pageModels[j];
                 const globalIdx = start + j;
                 const isSelected = model.id === currentModel;
+                
+                // Store in button map
+                buttonMap.set(globalIdx, model);
                 
                 row.addComponents(
                     new ButtonBuilder()
@@ -1222,6 +1268,10 @@ async function handleButtonInteraction(interaction) {
             content: `**Available Models** (${models.length} total, showing ${start + 1}-${Math.min(start + pageSize, models.length)})\n\nTap a model to select it.\n\nCurrent: \`${currentModel}\``,
             components: rows
         });
+        
+        // Store button map for this interaction
+        modelButtonMaps.set(interaction.id, buttonMap);
+        setTimeout(() => modelButtonMaps.delete(interaction.id), 10 * 60 * 1000);
     }
 }
 
@@ -1364,11 +1414,11 @@ async function handleTextMessage(message, sessionId) {
     const responseText = extractResponseText(response);
     
     if (responseText) {
-        // Split and send response
+        // Only send the last section of the response (users don't read all details)
         const parts = splitMessage(responseText);
-        for (const part of parts) {
-            await message.reply(part);
-        }
+        const lastPart = parts[parts.length - 1];
+        const prefix = parts.length > 1 ? `... (${parts.length - 1} sections omitted)\n\n` : '';
+        await message.reply(prefix + lastPart);
         
         // Parse file changes and post to changelog
         const filesChanged = parseFileChanges(responseText);
@@ -1430,10 +1480,11 @@ async function handleVoiceMessage(message, attachment, sessionId) {
     const responseText = extractResponseText(aiResponse);
     
     if (responseText) {
+        // Only send the last section of the response (users don't read all details)
         const parts = splitMessage(responseText);
-        for (const part of parts) {
-            await message.reply(part);
-        }
+        const lastPart = parts[parts.length - 1];
+        const prefix = parts.length > 1 ? `... (${parts.length - 1} sections omitted)\n\n` : '';
+        await message.reply(prefix + lastPart);
         
         // Parse file changes and post to changelog
         const filesChanged = parseFileChanges(responseText);
@@ -1456,45 +1507,111 @@ async function handleImageMessage(message, imageAttachments, sessionId) {
     const userId = message.author.id;
     const caption = message.content || 'What do you see in this image?';
     
+    console.log(`[IMAGE] Received ${imageAttachments.size} image(s) from user ${userId}`);
+    console.log(`[IMAGE] Caption: "${caption}"`);
+    
     // Send typing indicator
     await message.channel.sendTyping();
     
-    // Prepare message parts
+    // Prepare message parts - text first, then images (order matters for vision models)
     const parts = [];
     parts.push({ type: 'text', text: caption });
+    console.log(`[IMAGE] Added text part: "${caption}"`);
+    
+    // Ensure uploads directory exists
+    const uploadsDir = path.join(__dirname, 'uploads');
+    if (!fs.existsSync(uploadsDir)) {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+    }
     
     // Add images
+    const MAX_IMAGE_SIZE = 1024 * 1024; // 1MB max to avoid 413 errors from AI providers
+    const MAX_DIMENSION = 2048; // Max width/height for resizing
+    
     for (const [, attachment] of imageAttachments) {
-        // Download image
-        const response = await fetch(attachment.url);
-        const imageBuffer = Buffer.from(await response.arrayBuffer());
+        console.log(`[IMAGE] Processing attachment: ${attachment.name}, type: ${attachment.contentType}, size: ${attachment.size} bytes`);
         
-        // Save to temp file
-        const ext = attachment.contentType?.split('/')[1] || 'png';
-        const tempFile = path.join(os.tmpdir(), `image_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`);
-        fs.writeFileSync(tempFile, imageBuffer);
+        // Download image from Discord CDN
+        console.log(`[IMAGE] Downloading from: ${attachment.url.substring(0, 80)}...`);
+        const response = await fetch(attachment.url);
+        let imageBuffer = Buffer.from(await response.arrayBuffer());
+        console.log(`[IMAGE] Downloaded ${imageBuffer.length} bytes`);
+        
+        // Resize if image is too large
+        if (imageBuffer.length > MAX_IMAGE_SIZE) {
+            console.log(`[IMAGE] Image too large (${imageBuffer.length} bytes), resizing...`);
+            try {
+                // Get image metadata
+                const metadata = await sharp(imageBuffer).metadata();
+                console.log(`[IMAGE] Original dimensions: ${metadata.width}x${metadata.height}`);
+                
+                // Calculate new dimensions maintaining aspect ratio
+                let newWidth = metadata.width;
+                let newHeight = metadata.height;
+                
+                if (newWidth > MAX_DIMENSION || newHeight > MAX_DIMENSION) {
+                    if (newWidth > newHeight) {
+                        newHeight = Math.round(newHeight * (MAX_DIMENSION / newWidth));
+                        newWidth = MAX_DIMENSION;
+                    } else {
+                        newWidth = Math.round(newWidth * (MAX_DIMENSION / newHeight));
+                        newHeight = MAX_DIMENSION;
+                    }
+                }
+                
+                // Resize and compress - always output as JPEG for better compression
+                imageBuffer = await sharp(imageBuffer)
+                    .resize(newWidth, newHeight, { fit: 'inside', withoutEnlargement: true })
+                    .jpeg({ quality: 80 })
+                    .toBuffer();
+                
+                console.log(`[IMAGE] Resized to ${newWidth}x${newHeight}, new size: ${imageBuffer.length} bytes`);
+            } catch (resizeError) {
+                console.log(`[IMAGE] Resize failed: ${resizeError.message}, using original`);
+            }
+        }
+        
+        // Save to uploads folder with unique filename
+        // Use jpeg extension if we resized (since we convert to jpeg)
+        const wasResized = imageBuffer.length <= MAX_IMAGE_SIZE && attachment.size > MAX_IMAGE_SIZE;
+        const ext = wasResized ? 'jpeg' : (attachment.contentType?.split('/')[1] || 'png');
+        const fileName = `image_${userId}_${Date.now()}.${ext}`;
+        const uploadPath = path.join(uploadsDir, fileName);
+        fs.writeFileSync(uploadPath, imageBuffer);
+        console.log(`[IMAGE] Saved to: ${uploadPath}`);
+        
+        // Determine MIME type
+        const mimeType = wasResized ? 'image/jpeg' : (attachment.contentType || (ext === 'png' ? 'image/png' : 'image/jpeg'));
+        const fileUrl = `file://${uploadPath}`;
+        console.log(`[IMAGE] Using file URL: ${fileUrl}, MIME type: ${mimeType}`);
         
         parts.push({
             type: 'file',
-            mime: attachment.contentType || 'image/png',
-            url: `file://${tempFile}`,
-            filename: attachment.name
+            mime: mimeType,
+            url: fileUrl,
+            filename: fileName
         });
+        console.log(`[IMAGE] Added file part to request`);
     }
     
     // Send to OpenCode
     const userModel = getUserModel(userId);
     const modelObj = parseModelId(userModel);
+    console.log(`[IMAGE] User model: ${userModel}`);
+    console.log(`[IMAGE] Session ID: ${sessionId}`);
+    console.log(`[IMAGE] Sending ${parts.length} parts to OpenCode...`);
     
     const aiResponse = await sendPrompt(sessionId, parts, modelObj);
+    console.log(`[IMAGE] OpenCode response received`);
     
     const responseText = extractResponseText(aiResponse);
     
     if (responseText && responseText.trim()) {
+        // Only send the last section of the response (users don't read all details)
         const msgParts = splitMessage(responseText);
-        for (const part of msgParts) {
-            await message.reply(part);
-        }
+        const lastPart = msgParts[msgParts.length - 1];
+        const prefix = msgParts.length > 1 ? `... (${msgParts.length - 1} sections omitted)\n\n` : '';
+        await message.reply(prefix + lastPart);
         
         // Parse file changes and post to changelog
         const filesChanged = parseFileChanges(responseText);
@@ -1503,6 +1620,7 @@ async function handleImageMessage(message, imageAttachments, sessionId) {
             await postChangelog(userId, summary, filesChanged);
         }
     } else {
+        console.log(`[IMAGE] Empty response from AI - model may not support vision`);
         await message.reply('The AI model returned an empty response. This model may not support image analysis. Try using a vision-capable model with `/model`.');
     }
     
