@@ -46,6 +46,23 @@ curl -X POST "https://discord.com/api/v10/channels/1474467379692961926/messages"
 
 **This is mandatory for all git commits made by AI agents in this repository.**
 
+## IMPORTANT: Restarting Services After Code Changes
+
+**After making changes to `client.js`, `server.js`, or other runtime code, you MUST restart the affected services.**
+
+```bash
+# Restart the Discord client (includes webhook server)
+pm2 restart opendiscord-client-4098
+
+# Restart the OpenCode server (if server.js changed)
+pm2 restart opendiscord-server-4098
+
+# Check status
+pm2 list
+```
+
+**This is your responsibility as the AI agent. Do not leave services running old code.**
+
 ## Setup Workflow
 
 When a user asks for help setting up OpenDiscord, guide them through these steps ONE AT A TIME. Wait for their response before proceeding to the next step.
