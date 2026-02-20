@@ -164,6 +164,8 @@ pm2 list
 OPENCODE_PORT=4098
 ```
 
+**Important:** If there's already an OpenCode server running (e.g., `opentelegram-server` on port 4097), you can reuse it instead of starting a new one. Just set `OPENCODE_PORT` to match the existing server's port and skip starting `opendiscord-server`. Multiple clients can share the same OpenCode server.
+
 8. Start the bot using pm2. Use unique names with port numbers to avoid conflicts:
 ```bash
 # Replace $PORT with the OPENCODE_PORT value (e.g., 4097)
@@ -174,6 +176,11 @@ pm2 start "npm run client" --name "opendiscord-client-$PORT" --time
 Example with port 4097:
 ```bash
 pm2 start "npm run server" --name "opendiscord-server-4097" --time
+pm2 start "npm run client" --name "opendiscord-client-4097" --time
+```
+
+**If reusing an existing OpenCode server**, only start the client:
+```bash
 pm2 start "npm run client" --name "opendiscord-client-4097" --time
 ```
 
