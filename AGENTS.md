@@ -153,10 +153,28 @@ npm install
 npm run deploy
 ```
 
-6. Start the bot. You probably will use pm2 to run the app:
+6. Check which ports are already in use:
 ```bash
-pm2 start "npm run server" --name "opendiscord-server" --time
-pm2 start "npm run client" --name "opendiscord-client" --time
+pm2 list
+```
+
+7. Pick an unused port for OPENCODE_PORT (default is 4097). Update the `.env` file if needed:
+```bash
+# Example: if 4097 is in use, pick another port like 4098
+OPENCODE_PORT=4098
+```
+
+8. Start the bot using pm2. Use unique names with port numbers to avoid conflicts:
+```bash
+# Replace $PORT with the OPENCODE_PORT value (e.g., 4097)
+pm2 start "npm run server" --name "opendiscord-server-$PORT" --time
+pm2 start "npm run client" --name "opendiscord-client-$PORT" --time
+```
+
+Example with port 4097:
+```bash
+pm2 start "npm run server" --name "opendiscord-server-4097" --time
+pm2 start "npm run client" --name "opendiscord-client-4097" --time
 ```
 
 ### Step 8: First User Setup (Admin Registration)
@@ -258,3 +276,46 @@ Then restart the bot with `pm2 restart opendiscord-client`.
 - **Text messages** - Send any text to chat with the AI
 - **Voice messages** - Send voice notes (requires OpenAI API key)
 - **Images** - Send images with optional caption for AI analysis
+
+## Nginx Setup (Optional - for web dashboard)
+
+If you want to expose a web interface or health endpoint via a subdomain, set up Nginx:
+
+1. Create an Nginx config file:
+```bash
+sudo nano /etc/nginx/sites-available/opendiscord.yourdomain.com
+```
+
+2. Add the following configuration (replace `opendiscord.yourdomain.com` and port):
+```nginx
+server {
+    listen 80;
+    server_name opendiscord.yourdomain.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:3002;  # Match your PORT in .env
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+    }
+}
+```
+
+3. Enable the site and restart Nginx:
+```bash
+sudo ln -s /etc/nginx/sites-available/opendiscord.yourdomain.com /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+4. (Recommended) Set up SSL with Certbot:
+```bash
+sudo certbot --nginx -d opendiscord.yourdomain.com
+```
+
+**Note:** The Discord bot itself doesn't require Nginx - it connects directly to Discord via WebSocket. Nginx is only needed if you add a web dashboard or health check endpoint.
