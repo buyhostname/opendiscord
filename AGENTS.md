@@ -2,6 +2,50 @@
 
 This file provides instructions for AI agents to help users set up OpenDiscord.
 
+## IMPORTANT: Git Commit Changelog Notifications
+
+**When making git commits in this repository, you MUST post to the Discord changelog channel.**
+
+After every `git commit` and `git push`, send a notification to the changelog channel using the webhook:
+
+```bash
+# After committing, send to webhook
+HASH=$(git rev-parse HEAD)
+MESSAGE=$(git log -1 --pretty=%B)
+AUTHOR=$(git log -1 --pretty=%an)
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+FILES=$(git diff-tree --no-commit-id --name-only -r HEAD | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+curl -s -X POST "http://127.0.0.1:4099/git-commit" \
+  -H "Content-Type: application/json" \
+  -d "{\"hash\": \"$HASH\", \"message\": $(echo "$MESSAGE" | jq -R -s .), \"author\": \"$AUTHOR\", \"branch\": \"$BRANCH\", \"files\": $FILES}"
+```
+
+Or simply run the post-commit hook manually:
+```bash
+./scripts/post-commit-hook.sh
+```
+
+**Alternative: Direct Discord API (if webhook server is not running)**
+
+If the git webhook server isn't running, post directly to Discord channel `1474467379692961926`:
+
+```bash
+# Get commit info
+HASH=$(git rev-parse --short HEAD)
+MESSAGE=$(git log -1 --pretty=%B)
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+FILES=$(git diff-tree --no-commit-id --name-only -r HEAD | head -10 | tr '\n' ', ')
+
+# Post to Discord (requires DISCORD_BOT_TOKEN in environment)
+curl -X POST "https://discord.com/api/v10/channels/1474467379692961926/messages" \
+  -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"embeds\": [{\"title\": \"Git Commit\", \"description\": \"\`\`\`$MESSAGE\`\`\`\", \"color\": 5793266, \"fields\": [{\"name\": \"Commit\", \"value\": \"\`$HASH\`\", \"inline\": true}, {\"name\": \"Branch\", \"value\": \"\`$BRANCH\`\", \"inline\": true}, {\"name\": \"Files\", \"value\": \"\`$FILES\`\", \"inline\": false}]}]}"
+```
+
+**This is mandatory for all git commits made by AI agents in this repository.**
+
 ## Setup Workflow
 
 When a user asks for help setting up OpenDiscord, guide them through these steps ONE AT A TIME. Wait for their response before proceeding to the next step.

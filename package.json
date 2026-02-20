@@ -6,7 +6,9 @@
   "scripts": {
     "server": "node server.js",
     "client": "node client.js",
-    "deploy": "node deploy-commands.js"
+    "webhook": "node git-webhook.js",
+    "deploy": "node deploy-commands.js",
+    "install-hook": "cp scripts/post-commit-hook.sh .git/hooks/post-commit && chmod +x .git/hooks/post-commit"
   },
   "dependencies": {
     "@opencode-ai/sdk": "^1.2.6",
