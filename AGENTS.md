@@ -61,6 +61,8 @@ pm2 restart discord-s-4098
 pm2 list
 ```
 
+**Always run `pm2 save` after making any pm2 changes (start, stop, delete, rename).**
+
 **This is your responsibility as the AI agent. Do not leave services running old code.**
 
 ## Setup Workflow
