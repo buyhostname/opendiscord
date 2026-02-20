@@ -43,10 +43,12 @@ const client = new Client({
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.DirectMessages,
         GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMessageReactions, // For adding reactions to messages
     ],
     partials: [
         Partials.Channel, // Required for DM support
         Partials.Message,
+        Partials.Thread, // Required for thread support
     ],
 });
 
@@ -55,6 +57,10 @@ const userSessions = new Map();
 
 // Store user model preferences (userId -> modelId mapping)
 const userModels = new Map();
+
+// Track threads where the bot should auto-respond (threads created on bot messages)
+// Set of thread IDs
+const subscribedThreads = new Set();
 
 // Store models temporarily for button lookups (indexed)
 let modelIndex = new Map();
@@ -481,16 +487,7 @@ client.on('interactionCreate', async (interaction) => {
     
     const userId = interaction.user.id;
     
-    // Check if it's a DM
-    if (!interaction.channel?.isDMBased()) {
-        await interaction.reply({
-            content: 'This bot only works in DMs. Please send me a direct message!',
-            ephemeral: true
-        });
-        return;
-    }
-    
-    // Check authorization
+    // Check authorization first (works in both DMs and public channels)
     const auth = await checkUserAuthorized(userId);
     
     // Handle first user setup
@@ -840,8 +837,13 @@ client.on('messageCreate', async (message) => {
     // Ignore bot messages
     if (message.author.bot) return;
     
-    // Only handle DMs
-    if (!message.channel.isDMBased()) return;
+    // Handle DMs, mentions in public channels, or messages in subscribed threads
+    const isDM = message.channel.isDMBased();
+    const isMentioned = message.mentions.has(client.user);
+    const isInSubscribedThread = message.channel.isThread() && subscribedThreads.has(message.channel.id);
+    
+    // If not a DM, not mentioned, and not in a subscribed thread, ignore
+    if (!isDM && !isMentioned && !isInSubscribedThread) return;
     
     // Ignore messages from before bot start
     if (message.createdTimestamp < botStartTime) return;
@@ -882,6 +884,9 @@ client.on('messageCreate', async (message) => {
     );
     
     try {
+        // Add hourglass reaction to show we're processing
+        await message.react('⏳');
+        
         // Get or create session
         let sessionId = userSessions.get(userId);
         
@@ -910,6 +915,10 @@ client.on('messageCreate', async (message) => {
         
     } catch (error) {
         console.error('Error processing message:', error);
+        // Remove hourglass on error
+        try {
+            await message.reactions.cache.get('⏳')?.users.remove(client.user.id);
+        } catch (e) { /* ignore */ }
         await message.reply(`Error: ${error.message}`);
     }
 });
@@ -917,7 +926,11 @@ client.on('messageCreate', async (message) => {
 // Handle text messages
 async function handleTextMessage(message, sessionId) {
     const userId = message.author.id;
-    const text = message.content;
+    // Strip bot mention from message content if present
+    let text = message.content.replace(/<@!?\d+>/g, '').trim();
+    
+    // If message is empty after stripping mentions, ignore
+    if (!text) return;
     
     // Send typing indicator
     await message.channel.sendTyping();
@@ -953,6 +966,11 @@ async function handleTextMessage(message, sessionId) {
     } else {
         await message.reply('No response received. Please try again.');
     }
+    
+    // Remove hourglass reaction after completion
+    try {
+        await message.reactions.cache.get('⏳')?.users.remove(client.user.id);
+    } catch (e) { /* ignore */ }
 }
 
 // Handle voice messages
@@ -1012,6 +1030,11 @@ async function handleVoiceMessage(message, attachment, sessionId) {
     } else {
         await message.reply('No response received. Please try again.');
     }
+    
+    // Remove hourglass reaction after completion
+    try {
+        await message.reactions.cache.get('⏳')?.users.remove(client.user.id);
+    } catch (e) { /* ignore */ }
 }
 
 // Handle image messages
@@ -1068,6 +1091,11 @@ async function handleImageMessage(message, imageAttachments, sessionId) {
     } else {
         await message.reply('The AI model returned an empty response. This model may not support image analysis. Try using a vision-capable model with `/model`.');
     }
+    
+    // Remove hourglass reaction after completion
+    try {
+        await message.reactions.cache.get('⏳')?.users.remove(client.user.id);
+    } catch (e) { /* ignore */ }
 }
 
 // Bot ready event
@@ -1084,6 +1112,37 @@ client.once('ready', async () => {
         await ensureChangelogChannel();
     } else {
         console.warn(`Warning: Could not find guild with ID ${process.env.DISCORD_GUILD_ID}`);
+    }
+});
+
+// Handle thread creation - subscribe to threads created on bot messages
+client.on('threadCreate', async (thread) => {
+    try {
+        // Fetch the parent message that the thread was created on
+        if (thread.parentId) {
+            const parentChannel = thread.parent;
+            if (parentChannel && thread.id) {
+                // The thread's ID is also the starter message's ID in Discord
+                // We need to check if the starter message was from this bot
+                try {
+                    const starterMessage = await thread.fetchStarterMessage();
+                    if (starterMessage && starterMessage.author.id === client.user.id) {
+                        subscribedThreads.add(thread.id);
+                        console.log(`Subscribed to thread: ${thread.name} (${thread.id})`);
+                        
+                        // Join the thread to ensure we receive messages
+                        if (thread.joinable) {
+                            await thread.join();
+                        }
+                    }
+                } catch (err) {
+                    // If we can't fetch starter message, check if it's a reply thread to bot
+                    console.log(`Could not fetch starter message for thread ${thread.id}:`, err.message);
+                }
+            }
+        }
+    } catch (error) {
+        console.error('Error handling thread creation:', error);
     }
 });
 
