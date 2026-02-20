@@ -326,3 +326,28 @@ sudo certbot --nginx -d opendiscord.yourdomain.com
 ```
 
 **Note:** The Discord bot itself doesn't require Nginx - it connects directly to Discord via WebSocket. Nginx is only needed if you add a web dashboard or health check endpoint.
+
+## Adding a Custom Admin Button
+
+To add a quick-access button to the admin panel at `/root/admin`, edit the `buttons-custom.json` file:
+
+```bash
+nano /root/admin/buttons-custom.json
+```
+
+Add an entry like this to the JSON array (adjust the port to match your `OPENCODE_PORT`):
+
+```json
+{
+  "id": "opendiscord",
+  "name": "OPENDISCORD",
+  "command": "tmux new -s opendiscord -c /root/opendiscord opencode attach http://127.0.0.1:4097 2>/dev/null || tmux attach -t opendiscord",
+  "directory": "/root/opendiscord",
+  "hidePreview": false,
+  "builtin": false
+}
+```
+
+**Important:** Make sure the port in the URL (`4097` in this example) matches the `OPENCODE_PORT` value in your `.env` file.
+
+If a button with the same `id` already exists, modify it instead of adding a duplicate.
