@@ -164,7 +164,12 @@ pm2 list
 OPENCODE_PORT=4098
 ```
 
-**Important:** If there's already an OpenCode server running (e.g., `opentelegram-server` on port 4097), you can reuse it instead of starting a new one. Just set `OPENCODE_PORT` to match the existing server's port and skip starting `opendiscord-server`. Multiple clients can share the same OpenCode server.
+**Important - Working Directory:** The OpenCode server determines the AI's working directory. The server runs from the directory where it was started, and all file operations (pwd, ls, file edits, etc.) will be relative to that directory.
+
+- If you want the Discord bot to work on **this project's files** (`/root/opendiscord` or wherever you cloned it), you MUST start your own server from this directory.
+- If you reuse an existing server (e.g., `opentelegram-server`), the AI will work in THAT server's directory (e.g., `/root/opentelegram`), not this project's directory.
+
+**Recommendation:** Each project should have its own OpenCode server on a unique port if you want the AI to work in that project's directory.
 
 8. Start the bot using pm2. Use unique names with port numbers to avoid conflicts:
 ```bash
@@ -173,16 +178,17 @@ pm2 start "npm run server" --name "opendiscord-server-$PORT" --time
 pm2 start "npm run client" --name "opendiscord-client-$PORT" --time
 ```
 
-Example with port 4097:
+Example with port 4098 (for a separate opendiscord instance):
 ```bash
-pm2 start "npm run server" --name "opendiscord-server-4097" --time
-pm2 start "npm run client" --name "opendiscord-client-4097" --time
+pm2 start "npm run server" --name "opendiscord-server-4098" --time
+pm2 start "npm run client" --name "opendiscord-client-4098" --time
 ```
 
-**If reusing an existing OpenCode server**, only start the client:
+**If intentionally sharing another server's working directory**, only start the client:
 ```bash
 pm2 start "npm run client" --name "opendiscord-client-4097" --time
 ```
+Note: This means the AI will work in the shared server's directory, not opendiscord's directory.
 
 ### Step 8: First User Setup (Admin Registration)
 
