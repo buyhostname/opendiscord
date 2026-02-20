@@ -245,11 +245,13 @@ Example with port 4098 (for a separate opendiscord instance):
 ```bash
 pm2 start "npm run server" --name "discord-s-4098" --time
 pm2 start "npm run client" --name "discord-c-4098" --time
+pm2 save
 ```
 
 **If intentionally sharing another server's working directory**, only start the client:
 ```bash
 pm2 start "npm run client" --name "discord-c-4097" --time
+pm2 save
 ```
 Note: This means the AI will work in the shared server's directory, not opendiscord's directory.
 
