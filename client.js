@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import os from 'os';
+import http from 'http';
 import {
     Client,
     GatewayIntentBits,
@@ -1113,6 +1114,9 @@ client.once('ready', async () => {
     } else {
         console.warn(`Warning: Could not find guild with ID ${process.env.DISCORD_GUILD_ID}`);
     }
+    
+    // Start git webhook server
+    startGitWebhookServer();
 });
 
 // Handle thread creation - subscribe to threads created on bot messages
@@ -1145,6 +1149,109 @@ client.on('threadCreate', async (thread) => {
         console.error('Error handling thread creation:', error);
     }
 });
+
+// Git webhook server for changelog notifications
+const GIT_WEBHOOK_PORT = process.env.GIT_WEBHOOK_PORT || 4099;
+const CHANGELOG_CHANNEL_ID = '1474467379692961926';
+
+async function postGitCommit(commitData) {
+    let channel;
+    try {
+        channel = await client.channels.fetch(CHANGELOG_CHANNEL_ID);
+    } catch (error) {
+        console.error(`Failed to fetch changelog channel:`, error.message);
+        return false;
+    }
+    
+    const { hash, message, author, branch, files } = commitData;
+    
+    // Color based on commit type
+    let color = 0x5865F2;
+    const lowerMsg = message.toLowerCase();
+    if (lowerMsg.startsWith('fix') || lowerMsg.includes('bug')) {
+        color = 0xED4245;
+    } else if (lowerMsg.startsWith('add') || lowerMsg.startsWith('feat')) {
+        color = 0x57F287;
+    } else if (lowerMsg.startsWith('update') || lowerMsg.startsWith('refactor')) {
+        color = 0xFEE75C;
+    }
+    
+    let filesStr = 'No files detected';
+    if (files && files.length > 0) {
+        filesStr = files.slice(0, 15).map(f => `\`${f}\``).join('\n');
+        if (files.length > 15) filesStr += `\n... and ${files.length - 15} more`;
+    }
+    
+    const embed = new EmbedBuilder()
+        .setColor(color)
+        .setTitle('Git Commit')
+        .setDescription(`\`\`\`${message}\`\`\``)
+        .addFields(
+            { name: 'Commit', value: `\`${hash.slice(0, 7)}\``, inline: true },
+            { name: 'Branch', value: `\`${branch || 'main'}\``, inline: true },
+            { name: 'Author', value: author || 'Unknown', inline: true }
+        )
+        .setTimestamp()
+        .setFooter({ text: 'OpenDiscord Git Hook' });
+    
+    if (files && files.length > 0) {
+        embed.addFields({ name: `Files (${files.length})`, value: filesStr, inline: false });
+    }
+    
+    try {
+        await channel.send({ embeds: [embed] });
+        console.log(`Posted git commit ${hash.slice(0, 7)} to changelog`);
+        return true;
+    } catch (error) {
+        console.error('Failed to post to changelog:', error.message);
+        return false;
+    }
+}
+
+function startGitWebhookServer() {
+    const server = http.createServer(async (req, res) => {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+        
+        if (req.method === 'OPTIONS') {
+            res.writeHead(200);
+            res.end();
+            return;
+        }
+        
+        if (req.method === 'POST' && req.url === '/git-commit') {
+            let body = '';
+            req.on('data', chunk => body += chunk.toString());
+            req.on('end', async () => {
+                try {
+                    const commitData = JSON.parse(body);
+                    if (!commitData.hash || !commitData.message) {
+                        res.writeHead(400, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ error: 'Missing hash or message' }));
+                        return;
+                    }
+                    const success = await postGitCommit(commitData);
+                    res.writeHead(success ? 200 : 500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success }));
+                } catch (error) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: error.message }));
+                }
+            });
+        } else if (req.method === 'GET' && req.url === '/health') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'ok' }));
+        } else {
+            res.writeHead(404);
+            res.end();
+        }
+    });
+    
+    server.listen(GIT_WEBHOOK_PORT, '127.0.0.1', () => {
+        console.log(`Git webhook server listening on http://127.0.0.1:${GIT_WEBHOOK_PORT}`);
+    });
+}
 
 // Error handling
 client.on('error', (error) => {

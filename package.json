@@ -6,7 +6,6 @@
   "scripts": {
     "server": "node server.js",
     "client": "node client.js",
-    "webhook": "node git-webhook.js",
     "deploy": "node deploy-commands.js",
     "install-hook": "cp scripts/post-commit-hook.sh .git/hooks/post-commit && chmod +x .git/hooks/post-commit"
   },
