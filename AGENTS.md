@@ -52,10 +52,10 @@ curl -X POST "https://discord.com/api/v10/channels/1474467379692961926/messages"
 
 ```bash
 # Restart the Discord client (includes webhook server)
-pm2 restart opendiscord-client-4098
+pm2 restart discord-c-4098
 
 # Restart the OpenCode server (if server.js changed)
-pm2 restart opendiscord-server-4098
+pm2 restart discord-s-4098
 
 # Check status
 pm2 list
@@ -235,19 +235,19 @@ OPENCODE_PORT=4098
 8. Start the bot using pm2. Use unique names with port numbers to avoid conflicts:
 ```bash
 # Replace $PORT with the OPENCODE_PORT value (e.g., 4097)
-pm2 start "npm run server" --name "opendiscord-server-$PORT" --time
-pm2 start "npm run client" --name "opendiscord-client-$PORT" --time
+pm2 start "npm run server" --name "discord-s-$PORT" --time
+pm2 start "npm run client" --name "discord-c-$PORT" --time
 ```
 
 Example with port 4098 (for a separate opendiscord instance):
 ```bash
-pm2 start "npm run server" --name "opendiscord-server-4098" --time
-pm2 start "npm run client" --name "opendiscord-client-4098" --time
+pm2 start "npm run server" --name "discord-s-4098" --time
+pm2 start "npm run client" --name "discord-c-4098" --time
 ```
 
 **If intentionally sharing another server's working directory**, only start the client:
 ```bash
-pm2 start "npm run client" --name "opendiscord-client-4097" --time
+pm2 start "npm run client" --name "discord-c-4097" --time
 ```
 Note: This means the AI will work in the shared server's directory, not opendiscord's directory.
 
